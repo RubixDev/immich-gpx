@@ -12,16 +12,35 @@ use serde_json::json;
 
 #[derive(clap::Parser)]
 struct Cli {
-    /// Paths to gpx input files
+    /// Paths to gpx input files.
     gpx_files: Vec<PathBuf>,
 
-    /// URL to Immich server
+    /// URL to Immich server. E.g. `https://immich.example.com`
     #[clap(long)]
     server: String,
 
-    /// Owner ID of assets that should be modified
+    /// Don't actually send updates to Immich.
+    #[clap(short = 'n', long)]
+    dry_run: bool,
+
+    /// Only apply to assets owned by user with this ID.
     #[clap(long)]
-    owner: String,
+    owner: Option<String>,
+
+    /// Only apply to assets taken with a camera of this brand.
+    #[clap(long)]
+    camera_brand: Option<String>,
+
+    /// Only apply to assets taken with this camera model.
+    #[clap(long)]
+    camera_model: Option<String>,
+
+    /// Page number when searching assets.
+    ///
+    /// Pages are usually 250 items each, so by default only the latest 250
+    /// pictures without location data will be processed.
+    #[clap(short, long, default_value = "1")]
+    page: u32,
 }
 
 #[tokio::main]
@@ -73,9 +92,11 @@ async fn main() -> Result<()> {
     let images = client
         .post(format!("{base_url}/search/metadata"))
         .json(&json!({
-            "page": 1,
+            "page": args.page,
             "withExif": true,
             "country": null,
+            "make": args.camera_brand,
+            "model": args.camera_model,
         }))
         .send()
         .await
@@ -83,12 +104,11 @@ async fn main() -> Result<()> {
         .json::<SearchResult>()
         .await?;
 
-    for image in images
-        .assets
-        .items
-        .into_iter()
-        .filter(|img| img.owner_id == args.owner)
-    {
+    for image in images.assets.items.into_iter().filter(|img| {
+        args.owner.as_ref().is_none_or(|id| id == &img.owner_id)
+            && img.exif_info.latitude.is_none()
+            && img.exif_info.longitude.is_none()
+    }) {
         // find track including this time, if any
         let Some(track) = location_data
             .iter()
@@ -121,18 +141,20 @@ async fn main() -> Result<()> {
 
         // set location info
         println!(
-            "setting location {latitude}, {longitude} for image {}",
-            image.id
+            "setting location {latitude}, {longitude} for image {}/photos/{}",
+            args.server, image.id,
         );
-        client
-            .put(format!("{base_url}/assets/{}", image.id))
-            .json(&json!({
-                "latitude": latitude,
-                "longitude": longitude,
-            }))
-            .send()
-            .await
-            .context("failed to update asset")?;
+        if !args.dry_run {
+            client
+                .put(format!("{base_url}/assets/{}", image.id))
+                .json(&json!({
+                    "latitude": latitude,
+                    "longitude": longitude,
+                }))
+                .send()
+                .await
+                .context("failed to update asset")?;
+        }
     }
 
     Ok(())
@@ -168,4 +190,6 @@ struct AssetResponseDto {
 #[serde(rename_all = "camelCase")]
 struct ExifResponseDto {
     date_time_original: DateTime<Utc>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
